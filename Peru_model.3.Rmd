@@ -1,0 +1,280 @@
+---
+title: "PAHO Subnational Analysis -- Peru"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#library(brazilmaps)
+#library(ggplot2)
+#library(readxl)
+library(rjags)
+library(reshape2)
+library(lubridate)
+library(HDInterval)
+```
+
+## 1. Import data and a JAGS model string
+
+```{r}
+pr4 <- read.csv( 'pr.dept.inc.v1.csv', as.is = T)
+source("JAGS_model_strings_final.R")
+```
+
+## 2. Set up (select the age group and outcome)
+
+```{r}
+# Select the age group you want to analyze
+pr4.1 <- pr4[pr4$agec %in% c(1),] # "1" is 2-23 mo for Peru
+
+# Cutoff value for filtering sparse data
+filter.cutoff <- 10*10 # 10 deaths per year on average * 10 years
+
+# Select the outcome 
+select.outcome <- "j12any" # j12any or j12prim
+
+# Select the set of control diseases you want to include in the model
+select.set <- 2 # Control disease set 1 or 2 (2 is what we used in the final version of the analysis)
+
+# Set the number of iterations
+burnN <- 10*1000 
+sampleN <- 100*1000
+
+# Select model_string7
+select.model <- "model_string7"
+model_spec <- textConnection(model_string7)
+
+# Scale PCV uptake data? 
+scale.vax <- "yes" # yes or no
+
+# Save .RData?
+save.files <- "yes" # yes or no
+```
+
+## 3. Reshape data for JAGS
+
+### 3.1 Disease time series
+
+```{r}
+pr4.m <- melt(pr4.1[,c('dept.inc', 'Year', 'agec',
+                       "J12_J18_prim", "J12_J18_any", "acm_noj_prim", 
+                       "E40_E46_prim", "R95_R99_prim", "R00_R09_prim", 
+                       "G90_G99_prim", "N00_N99_prim", "P00_P96_prim", 
+                       "A00_B99_prim", "Q00_Q99_prim")], 
+              id.vars=c('dept.inc','Year','agec'))
+
+# Sums over whichever age groups are in the data
+j12.c     <- dcast(pr4.m[pr4.m$variable=='J12_J18_prim',], dept.inc ~ Year, sum)
+j12.c.any <- dcast(pr4.m[pr4.m$variable=='J12_J18_any',],  dept.inc ~ Year, sum)
+a00.c     <- dcast(pr4.m[pr4.m$variable=='A00_B99_prim',], dept.inc ~ Year, sum)
+e40.c     <- dcast(pr4.m[pr4.m$variable=='E40_E46_prim',], dept.inc ~ Year, sum)
+g90.c     <- dcast(pr4.m[pr4.m$variable=='G90_G99_prim',], dept.inc ~ Year, sum)
+n00.c     <- dcast(pr4.m[pr4.m$variable=='N00_N99_prim',], dept.inc ~ Year, sum)
+r00.c     <- dcast(pr4.m[pr4.m$variable=='R00_R09_prim',], dept.inc ~ Year, sum)
+r95.c     <- dcast(pr4.m[pr4.m$variable=='R95_R99_prim',], dept.inc ~ Year, sum)
+p00.c     <- dcast(pr4.m[pr4.m$variable=='P00_P96_prim',], dept.inc ~ Year, sum)
+q00.c     <- dcast(pr4.m[pr4.m$variable=='Q00_Q99_prim',], dept.inc ~ Year, sum)
+acm.c     <- dcast(pr4.m[pr4.m$variable=='acm_noj_prim',], dept.inc ~ Year, sum)
+
+#-----*-----*-----*-----*-----*-----*-----*-----*-----#
+# Filter out dept.inc with too sparse data 
+#-----*-----*-----*-----*-----*-----*-----*-----*-----#
+
+# Make sure that rows of the datasets are ordered correctly
+j12.c     <- j12.c[order(j12.c$dept.inc),]
+j12.c.any <- j12.c.any[order(j12.c.any$dept.inc),]
+acm.c     <- acm.c[order(acm.c$dept.inc),]
+
+# Count the total number of the J12-J18 any in all years for each subnational region (dept.inc)
+tot.j12.any <- rowSums(j12.c.any[,-1]) 
+
+# Flag states with sparse data
+sparse <- ifelse(tot.j12.any<filter.cutoff, 1, 0)
+
+# Create a vector of dept.inc with sparse data
+sparse.dept.inc <- j12.c$dept.inc[which(sparse==1)] 
+
+# Filter out regions with sparse data and create new datasets
+j12.f     <- j12.c[!(j12.c$dept.inc %in% sparse.dept.inc),]
+j12.any.f <- j12.c.any[!(j12.c.any$dept.inc %in% sparse.dept.inc),]
+a00.f     <- a00.c[!(a00.c$dept.inc %in% sparse.dept.inc),]
+e40.f     <- e40.c[!(e40.c$dept.inc %in% sparse.dept.inc),]
+g90.f     <- g90.c[!(g90.c$dept.inc %in% sparse.dept.inc),]
+n00.f     <- n00.c[!(n00.c$dept.inc %in% sparse.dept.inc),]
+r00.f     <- r00.c[!(r00.c$dept.inc %in% sparse.dept.inc),]
+r95.f     <- r95.c[!(r95.c$dept.inc %in% sparse.dept.inc),]
+p00.f     <- p00.c[!(p00.c$dept.inc %in% sparse.dept.inc),]
+q00.f     <- q00.c[!(q00.c$dept.inc %in% sparse.dept.inc),]
+acm.f     <- acm.c[!(acm.c$dept.inc %in% sparse.dept.inc),]
+
+# Remove the first column "dept.inc"
+j12.f1     <- j12.f[,-1] 
+j12.any.f1 <- j12.any.f[,-1] 
+a00.f1     <- a00.f[,-1]
+e40.f1     <- e40.f[,-1]
+g90.f1     <- g90.f[,-1]
+n00.f1     <- n00.f[,-1]
+r00.f1     <- r00.f[,-1]
+r95.f1     <- r95.f[,-1]
+p00.f1     <- p00.f[,-1]
+q00.f1     <- q00.f[,-1]
+acm.f1     <- acm.f[,-1]
+
+# Log transform
+log.acm.f1 <- log(acm.f1 + 0.5) 
+```
+
+### 3.2 PCV Coverage Time Series
+
+```{r}
+# Load the PCV 3rd dose coverage data
+vax.0 <- read.csv(file='pr.cov.by.dept.inc.csv', as.is=T)
+
+# Reshape
+vax.1 <- dcast(vax.0, dept.inc ~ Year, mean, value.var="PCV3.coverage")
+
+# Keep only dept.inc that are included in pr4.1
+vax.2 <- vax.1[vax.1$dept.inc %in% unique(pr4.1$dept.inc), ]
+
+# Filter out dept.inc with too sparse data (see above)
+vax.2.f <- vax.2[!(vax.2$dept.inc %in% sparse.dept.inc),]
+
+# Convert % to proportion (e.g., 80% --> 0.8)
+vax.2.f[,-1] <- vax.2.f[,-1]/100 
+vax.c <- vax.2.f[,-1]
+
+# Create an income-level varaible (2 is the least poorest and 0 is the poorest)
+inc.lvl0 <- j12.f$dept.inc 
+inc.lvl <- NA
+inc.lvl <- ifelse(substr(inc.lvl0,4,7)=="high", 2, inc.lvl)
+inc.lvl <- ifelse(substr(inc.lvl0,4,6)=="med",  1, inc.lvl)
+inc.lvl <- ifelse(substr(inc.lvl0,4,6)=="low",  0, inc.lvl)
+```
+
+## 4. Call model
+
+```{r}
+# Specify initial values for a JAGS model
+inits1 <- list(".RNG.seed"=c(123), ".RNG.name"='base::Wichmann-Hill')
+
+# Select the set of controls you will include in the model
+# NOTE: select.set has been set at the top of this script.
+if (select.set==1) {
+  # Set 1
+  x <- array(1, c(nrow(j12.f1), ncol(j12.f1), 4))
+  x[,,2] <- as.matrix(log.acm.f1)
+  x[,,3] <- as.matrix(log(e40.f1 + 0.5)) # Need filtering
+  x[,,4] <- as.matrix(log(r95.f1 + 0.5)) # Need filtering
+} else if (select.set==2) {
+  # Set 2
+  x <- array(1, c(nrow(j12.f1), ncol(j12.f1), 2))
+  x[,,2] <- as.matrix(log.acm.f1)
+}
+
+# Matrix for the poverty level data for each municipality
+z <- matrix(1, nrow=nrow(j12.f1), ncol=3)
+z[,2] <- ifelse(inc.lvl==1, 1, 0) # 1 if the income level is 1 (medium), 0 otherwise
+z[,3] <- ifelse(inc.lvl==2, 1, 0) # 1 if the income level is 2 (high), 0 otherwise
+
+# Scale vaccine coverage data, if you need
+if (scale.vax == "yes") {
+  vax.c.mat <- as.matrix(vax.c)
+  mean.vax.c <- mean(vax.c.mat)
+  sd.vax.c <- sd(vax.c.mat)
+  vax.c.scale <- vax.c.mat/sd.vax.c
+} else if (scale.vax == "no") {
+  vax.c.scale <- as.matrix(vax.c)
+}
+
+```
+
+## 5. Run the model 
+
+```{r}
+if (select.outcome=="j12any") {
+  model_jags <- jags.model(model_spec,
+                           # inits = list(inits1, inits2, inits3), # initialization
+                           inits = list(inits1), # initialization
+                           data = list('y' = j12.any.f1, # No. of j12_j18 by year
+                                       'subnat' = nrow(j12.any.f1), # No. of spatial units
+                                       'time' = ncol(j12.any.f1), # No. of years
+                                       'x' = x, # Control disease time series with an intercept
+                                       'vax' = vax.c.scale, # scaled PCV coverage by year for each spatial unit
+                                       'p_x' = dim(x)[3], # No. of controls and intercept
+                                       'p_z' = ncol(z), # No. of poverty level categories
+                                       'z' = z # Matrix for the poverty level and intercept
+                           ),
+                           n.adapt = burnN,
+                           n.chains = 1)
+} else if (select.outcome=="j12prim") {
+  model_jags <- jags.model(model_spec,
+                           # inits = list(inits1, inits2, inits3), # initialization
+                           inits = list(inits1), # initialization
+                           data = list('y' = j12.f1, # No. of j12_j18 by year
+                                       'subnat' = nrow(j12.f1), # No. of spatial units
+                                       'time' = ncol(j12.f1), # No. of years
+                                       'x' = x, # Control disease time series with an intercept
+                                       'vax' = vax.c.scale, # scaled PCV coverage by year for each spatial unit
+                                       'p_x' = dim(x)[3], # No. of controls and intercept
+                                       'p_z' = ncol(z), # No. of poverty level categories
+                                       'z' = z # Matrix for the poverty level and intercept
+                           ),
+                           n.adapt = burnN,
+                           n.chains = 1)
+}
+
+# Parameters you want to keep track of
+params <- c('beta', 'theta', 'eta', 'disp', 'gamma', 'ave.effect.pov', 'log.rr.vax', 'lambda')
+
+# Posterior sampling
+posterior_samples <- coda.samples(model_jags, params, n.iter = sampleN)
+
+# Combine posterior samples from all chains and save it
+posterior_samples.all <- do.call(rbind, posterior_samples)
+```
+
+## 6. Extract posterior medians and 95% CrIs for paramesters
+
+```{r}
+# Calculate the median of the posterior samples
+post_means <- apply(posterior_samples.all, 2, median)
+sample.labs <- names(post_means)
+
+# Calculte the 95% CrIs using HDI
+ci <- t(hdi(posterior_samples.all, credMass = 0.95))
+row.names(ci) <- sample.labs
+
+# beta1 (coefficient for an intercept)
+beta1 <- post_means[grep("^beta.*,1]", names(post_means))]
+beta1.ci <- ci[grep("^beta.*,1]", dimnames(ci)[[1]]), ]
+
+# beta2 (coefficient for acm noj)
+beta2 <- post_means[grep("^beta.*,2]", names(post_means))]
+beta2.ci <- ci[grep("^beta.*,2]", dimnames(ci)[[1]]), ]
+
+# theta1 (coefficient for vaccine coverage)
+theta <- post_means[grep("theta", names(post_means))]
+theta.ci <- ci[grep("theta", dimnames(ci)[[1]]), ]
+
+# Rate ratio, RR at last time point
+log.rr.vax <- post_means[grep(paste0("^log.rr.vax.*,", ncol(j12.f1),"]"), names(post_means)) ]
+log.rr.vax.ci <- ci[grep(paste0("^log.rr.vax.*,", ncol(j12.f1),"]"), dimnames(ci)[[1]]), ]
+log.rr.vax.all <- post_means[grep(paste0("log.rr.vax"), names(post_means)) ]
+log.rr.vax.all <- t(matrix(log.rr.vax.all, ncol=ncol(j12.f1)))
+
+# Average effect by the income level
+ave.effect.pov <- post_means[grep("ave.effect.pov", names(post_means))]
+ave.effect.pov.ci <- ci[grep("ave.effect.pov", dimnames(ci)[[1]]), ]
+ave.effect.pov.combo  <- cbind.data.frame(ave.effect.pov, ave.effect.pov.ci)
+
+# Create a list of posterior summaries
+out.list <- list('theta'=theta, 'theta.ci'=theta.ci,
+                 'beta1'=beta1, 'beta1.ci'=beta1.ci,
+                 'beta2'=beta2, 'beta2.ci'=beta2.ci,
+                 'log.rr.vax'=log.rr.vax, 'log.rr.vax.ci'=log.rr.vax.ci,
+                 'log.rr.vax.all'=log.rr.vax.all,
+                 'ave.effect.pov.combo'=ave.effect.pov.combo)
+```
