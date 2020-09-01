@@ -20,7 +20,7 @@ library(HDInterval)
 ## 1. Import data and a JAGS model string
 
 ```{r}
-pr4 <- read.csv( 'pr.dept.inc.v1.csv', as.is = T)
+pr4 <- read.csv( '../Data/pr.dept.inc.v1.csv', as.is = T)
 source("JAGS_model_strings_final.R")
 ```
 

@@ -1,0 +1,556 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rjags)
+library(reshape2)
+library(lubridate)
+library(HDInterval)
+library(stringr)
+
+```
+
+## Import data
+```{r}
+br4<-read.csv( '../Data/br.gdp.v1.qtr.csv')
+#cov.hdi.vipr<- read.csv('../Data/vipr coverage and hdi mesoregion.csv')
+#cov.hdi.vipr<-unique(cov.hdi.vipr)
+br4 <- br4[br4$year<=2015,]
+#br4<-br4[br4$!=5301,] #exclude brasilia
+
+```
+
+##Fix vax coverage data
+If >100% fix to 100%
+```{r}
+#br4$coverage3[br4$coverage3>100]<-100
+#br4<-merge(br4, cov.hdi.vipr[,c('Meso','year','PCV_Uptake6.59_vipr')], by.x=c('mesoregion','year'), by.y=c('Meso', 'year'), all.x=T)
+#br4<-merge(br4, unique(cov.hdi.vipr[,c('Meso','mean_hdi_vipr')]), by.y=c('Meso'),by.x='mesoregion', all.x=T)
+#br4$PCV_Uptake6.59_vipr[is.na(br4$PCV_Uptake6.59_vipr) & br4$year<=2010]<-0
+
+```
+
+##Which age subset do we want to analyze?
+```{r}
+br4<-br4[br4$agec %in% c(2,3),] #Subsets the datasets
+```
+
+```{r, eval=F}
+lmic<-c(0, 3995)*1.659
+umic<-c(3996,12375)*1.659
+ui<-c(12375.01, 100000000)*1.659
+
+
+br4$gdpgrp <- word(br4$gdp.region, 2, sep = "_")
+
+br4$gdpgrp <- as.factor(br4$gdpgrp)
+
+
+br4$cov3.scale <- scale(br4$coverage3)
+br4$log.ach <- scale(log(br4$ach.noj+0.5))
+br4$mesoregion2 <- br4$mesoregion
+br4$yearN <- br4$year- 2005
+
+br4$id <- as.factor(1:nrow(br4))
+#library(lme4)
+#mod1 <- glmer(j12_18_any ~ log.ach + cov3.scale + gdpgrp + cov3.scale*gdpgrp +(cov3.scale|mesoregion2), family='poisson', data=br4 )
+
+br5 <- aggregate(br4[,c('j12_18_any','ach.noj')], by=list('yearN'=br4$yearN,'gdp.region'=br4$gdp.region, 'gdpgrp'=br4$gdpgrp), FUN=sum)
+
+cov1 <- aggregate(br4[,c('coverage3')], by=list('yearN'=br4$yearN,'gdp.region'=br4$gdp.region, 'gdpgrp'=br4$gdpgrp), FUN=mean)
+
+library(INLA)
+#https://tem11010.github.io/timeseries-inla/
+mod.mat <- as.data.frame(model.matrix( ~ as.factor(mesoregion), data=br5)[,-1])
+names(mod.mat) <- paste0('mr', 1:ncol(mod.mat))
+
+yearN.mat <- as.data.frame(matrix(rep(br5$yearN, each=ncol(mod.mat) ),byrow=T, ncol=ncol(mod.mat)))
+
+names(yearN.mat) <- paste0('yearN', 1:ncol(mod.mat))
+
+br6 <- cbind.data.frame(br5,yearN.mat,mod.mat, cov1[,1])
+br6$log.ach <- scale(log(br6$ach.noj))
+br6$cov3.scale <- scale(br6$`cov1[, 1]`)
+br6$mesoregion2 <- br6$mesoregion
+U <- 1
+hyper.prec <- list(theta = list(prior = "loggamma", param = c(0.01, 0.01))) 
+
+piece1 <- paste0('f(', 
+      names(yearN.mat), 
+      ',', 
+      names(mod.mat),
+      ",model = 'ar1',  hyper = hyper.prec )" 
+      )
+piece2 <- paste(piece1, collapse='+')
+
+form1 <-as.formula(paste0("j12_18_any ~ log.ach +  gdpgrp + 
+                   cov3.scale*gdpgrp + 
+                   f(mesoregion2, cov3.scale,model='iid') +",
+                   piece2        ))
+mod2 <- inla(form1, family='poisson', data=br6 , control.family=list(link="log"),
+               control.compute=list(dic = TRUE, waic = TRUE, cpo = TRUE))
+
+```
+
+
+
+Reshape data for JAGS
+```{r}
+#reshape the data for JAGS
+br4.m<-melt(br4[,c('gdp.region','year','agec','j12_j18','j12_18_any','ach.noj',"e40_46",'r95_99','coverage3',"gdp.2011")], id.vars=c('gdp.region','year','agec'))
+
+#Filter out sparse regions with <1 death/year
+filter1<-dcast(br4.m[br4.m$variable=='j12_j18',],gdp.region~year, sum)
+keep <- which(apply(filter1[,-1],1, mean) > 10)
+mes.keep <-filter1$gdp.region[keep]
+
+br4.m <- br4.m[br4.m$gdp.region %in% mes.keep,]
+br4.m$gdp.region <- factor(br4.m$gdp.region)
+
+#Sums over whichever age groups are in the data
+j12.c <-
+  dcast(br4.m[br4.m$variable=='j12_j18',],gdp.region~year, sum)
+j12.c<-j12.c[,-1]
+
+j12.c.all<-dcast(br4.m[br4.m$variable=='j12_18_any',],gdp.region~year, sum)
+j12.c.all<-j12.c.all[,-1] 
+
+e40.c<-dcast(br4.m[br4.m$variable=='e40_46',],gdp.region~year, sum)
+e40.c<-e40.c[,-1]
+
+r95.c<-dcast(br4.m[br4.m$variable=='r95_99',],gdp.region~year, sum)
+r95.c<-r95.c[,-1]
+
+ach.c<-dcast(br4.m[br4.m$variable=='ach.noj',],gdp.region~year, sum)
+ach.c<-ach.c[,-1, drop=F]
+
+log.ach.c<-log(ach.c)
+
+prop_j12_prim.c<-
+  (as.matrix(j12.c)+0.5)/(as.matrix(j12.c.all)+0.5)
+
+
+#Lower middle, upper middle, upper based on USD, multiply by 1.659 to reais basd on Jan 2011
+#And 2011 GNI thresholds: https://datatopics.worldbank.org/world-development-indicators/stories/the-classification-of-countries-by-income.html
+
+#Matches updated numbers from Cristiana used for CO as well
+ lmic<-c(0, 3995)*1.659
+ umic<-c(3996,12375)*1.659
+ ui<-c(12375.01, 100000000)*1.659
+
+gdp.c<-dcast(br4.m[br4.m$variable=='gdp.2011',],gdp.region~., mean)
+gdp.c<-gdp.c[,-1]
+gdp.med<-gdp.c
+gdp.med[]<-0
+gdp.med[gdp.c>=umic[1] & gdp.c<umic[2] ]<-1
+gdp.hi<-gdp.c
+gdp.hi[]<-0
+gdp.hi[gdp.c>=ui[1]]<-1
+
+vax.c<-dcast(br4.m[br4.m$variable=='coverage3',],gdp.region~year, mean)
+vax.c<-vax.c[,-1]
+vax.c<-vax.c/100
+
+#vax.c$`2015` <- vax.c$`2014` #the 2015 vaccine data looks unstable; assume it is same as 2014
+
+
+gdp.cat<-rep(1, length=length(gdp.c))
+gdp.cat[gdp.med==1] <-2
+gdp.cat[gdp.hi==1] <-3
+
+```
+
+```{r}
+j12.c.sum<-aggregate(j12.c, by=list('hdi.cat'=gdp.cat), FUN=sum)
+ach.c.sum<-aggregate(ach.c, by=list('hdi.cat'=gdp.cat), FUN=sum)
+e40.c.sum<-aggregate(e40.c, by=list('hdi.cat'=gdp.cat), FUN=sum)
+r95.c.sum<-aggregate(r95.c, by=list('hdi.cat'=gdp.cat), FUN=sum)
+
+matplot(t(j12.c.sum[,-1])/ t(ach.c.sum[,-1]), type='l' )
+abline(v=5.5)
+
+matplot(t(j12.c.sum[,-1])/ t(e40.c.sum[,-1]), type='l' )
+abline(v=5.5)
+
+matplot(t(j12.c.sum[,-1]) , type='l')
+abline(v=5.5)
+
+matplot(t(r95.c.sum[,-1]) , type='l')
+abline(v=5.5)
+
+matplot(t(j12.c.sum[,-1])/ t(r95.c.sum[,-1]), type='l' )
+abline(v=5.5)
+```
+
+```{r, fig.width=3, fig.height=3}
+par(mfrow=c(1,1))
+scale1.j12 <- apply(j12.c.sum[,-1],1, function (x) x/x['2009'])
+matplot(2005:2015,scale1.j12, type='l', col=c('red','black','blue'), bty='l', ylab='Deaths relative to 2009', xlab='')
+abline(h=1, lty=2, col='gray')
+```
+Ave coverage
+```{r}
+
+round(sum(vax.c$`2015`*j12.c$`2010`/sum(j12.c$`2010`, na.rm=T), na.rm=T)*100,1)
+```
+
+
+
+Draft of model
+```{r}
+model_string<-"
+
+model{
+
+for(i in 1:subnat){
+
+   for(t in 1:time){
+
+      y[i,t] ~ dpois(lambda[i,t])
+      log(lambda[i,t]) <- x[i,t,]%*%beta[i,] + 
+                          vax[i,t]%*%theta[i] +
+                          disp[i,t]
+
+      log.rr.vax[i,t] <- vax[i,t]%*%theta[i]
+   }
+   
+   for(j in 1:p_x){
+      beta[i,j] ~ dnorm(mu_beta[j], inv_var_beta[j])
+   }
+      
+   theta[i] <-z[i,]%*%gamma  + eta[i]
+   eta[i] ~ dnorm(0, inv_var_eta)
+}
+
+for(i in 1:subnat){
+    disp[i,1]~dnorm(0,tau.disp)
+  for(t in 2:time){
+    disp[i,t]~dnorm( disp[i,t-1]*rho,tau.disp)
+  }
+}
+
+rho ~ dunif(0,1)
+
+#https://stackoverflow.com/questions/47135726/error-slicer-stuck-at-value-with-infinite-density-running-binomial-beta-model
+# for(i in 1:subnat){
+#  rho[i] ~ dbeta((a+0.01),(b+0.01))T(0.001,0.999)
+#  tau.disp[i] ~ dgamma(c, d)
+# }
+# 
+#   a ~ dgamma(0.01,0.01)
+#   b ~ dgamma(0.01,0.01)
+#   c ~ dgamma(0.01,0.01)
+#   d ~ dgamma(0.01,0.01)
+
+for (j in 1:p_x) {
+   mu_beta[j] ~ dnorm(0, 0.0001)
+   inv_var_beta[j] ~ dgamma(0.01,0.01)
+}
+
+  gamma[1] ~ dnorm(0, 0.0001) #reference
+  gamma[2] ~ dnorm(0, 0.0001)
+ # gamma[3] <- step(gamma[2]-gamma[1])*(gamma[2] + delta) +
+ #             step(gamma[1]-gamma[2])*(gamma[2] - delta)
+  gamma[3] ~dnorm(0, 0.0001)
+
+  delta ~dgamma(0.01,0.01)
+  
+  ave.effect.pov[1] <- gamma[1] 
+  ave.effect.pov[2] <- gamma[1] + gamma[2]
+  ave.effect.pov[3] <- gamma[1] + gamma[3]
+
+    inv_var_eta~dgamma(0.01,0.01)
+  mu.eta ~ dnorm(0, 1e-4)
+
+  tau.disp~dgamma(0.01,0.01)
+  
+}
+"
+```
+
+
+
+Call model
+```{r}
+  ##############################################################
+  #Model Fitting
+  ##############################################################
+  inits1=list(".RNG.seed"=c(12345), ".RNG.name"='base::Wichmann-Hill')
+  inits2=list(".RNG.seed"=c(45678), ".RNG.name"='base::Wichmann-Hill')
+  inits3=list(".RNG.seed"=c(78901), ".RNG.name"='base::Wichmann-Hill')
+  burnN=10000
+  sampleN=100000
+  ##############################################
+  #Model Organization
+  ##############################################
+  
+  x<-array(1,
+           c(nrow(j12.c),
+             ncol(j12.c),
+             2))
+  x[,,2]<-as.matrix(log.ach.c)
+  #x[,,3]<-as.matrix(log(e40.c+0.5))
+  #x[,,4]<-as.matrix(log(r95.c+0.5))
+
+    z <- matrix(1,
+             nrow=nrow(j12.c),
+             ncol=3)
+    z[,2] <- gdp.med
+    z[,3] <- gdp.hi
+    
+  #missing values of vax (for testing purposes only)
+  vax.c[is.na(vax.c) == 1]<-0
+  
+  vax.c.mat <- as.matrix(vax.c)
+  mean.vax.c <- mean(vax.c.mat)
+  sd.vax.c <- sd(vax.c.mat)
+  #vax.c.scale <- (vax.c.mat - mean.vax.c)/sd.vax.c
+  vax.c.scale <- (vax.c.mat )/sd.vax.c
+
+```
+  
+```{r}
+  model_spec<-textConnection(model_string)
+  model_jags<-jags.model(model_spec, 
+                         inits=list(inits1),
+                         data=list('y' = as.matrix(j12.c.all),
+                                   'subnat' = nrow(j12.c),
+                                   'time' = ncol(j12.c), 
+                                   'x' = x,
+                                   'vax' = vax.c.scale,
+                                   'p_x' = dim(x)[3],
+                                   'p_z' = ncol(z),
+                                   'gdp.index'=gdp.cat,
+                                   'z' = z
+                                   ),
+                         n.adapt=burnN, 
+                         n.chains=1)
+  params<-c('beta.agg','theta','gamma','log.rr.vax', 'ave.effect.pov', 'lambda')
+  
+  ##############################################
+  #Posterior Sampling
+  ##############################################
+  posterior_samples<-coda.samples(model_jags, 
+                                  params, 
+                                  n.iter=sampleN)
+  posterior_samples.all<-do.call(rbind,posterior_samples)
+  post_means<-apply(posterior_samples.all, 2, median)
+  sample.labs<-names(post_means)
+  ci<-t(hdi(posterior_samples.all, credMass = 0.95))
+  row.names(ci)<-sample.labs
+  names(post_means)<-sample.labs
+```
+
+```{r, eval=F, fig.width=6, fig.height=10}
+plot(posterior_samples, ask=T)
+```
+
+## Calculate DIC
+
+```{r}
+#DIC
+y<-as.vector(as.matrix(j12.c))
+    reg.mean.fitted<- t(posterior_samples.all[,grep('lambda', dimnames(posterior_samples.all)[[2]] )])
+    pred.count<-reg.mean.fitted #lambda
+    pred.count.mean<-apply(pred.count,1,mean)
+    log.like.func<-function(x1){
+    neg_two_loglike_poisson<- -2*sum(dpois(as.vector(y), 
+                                             lambda = x1, 
+                                             log = TRUE))
+    }
+    log.lik.mat<-apply(pred.count,2,log.like.func) #Object of length D, with -2LL estimates
+      #Calculate the mean of the fitted values. Prd.count mean, is a vector of length N,
+    #And use this to calculate neg_two_loglike_poisson_mean
+    neg_two_loglike_poisson_mean<- -2*sum(dpois(as.vector(y),
+                                                lambda = pred.count.mean,
+                                                log = TRUE))
+    DIC<- 2*(mean(log.lik.mat)) -   neg_two_loglike_poisson_mean
+    p_D<-  mean(log.lik.mat)  -   neg_two_loglike_poisson_mean #number of parameters
+    DIC
+    p_D
+```
+
+Gamma2 and Gamma3 tells us the effect of SES
+```{r}
+beta1<-post_means[grep("^beta.*,1]", names(post_means))]
+beta1.ci<-ci[grep("^beta.*,1]", dimnames(ci)[[1]]), ]
+beta2<-post_means[grep("^beta.*,2]", names(post_means))]
+beta2.ci<-ci[grep("^beta.*,2]", dimnames(ci)[[1]]), ]
+
+gamma<-post_means[grep('gamma', names(post_means))]
+
+gamma.ci<-ci[grep("gamma", dimnames(ci)[[1]]), ]
+gamma.ci <-
+  cbind.data.frame(gamma,gamma.ci)
+
+
+theta1<-post_means[grep("theta", names(post_means))]
+theta1.ci<-ci[grep("theta", dimnames(ci)[[1]]), ]
+
+delta<-post_means[grep("delta.adj", names(post_means))]
+delta.ci<-ci[grep("delta.adj", dimnames(ci)[[1]]), ]
+delta.combo<-exp(cbind(delta, delta.ci))
+
+ave.effect.pov<-
+  post_means[grep("ave.effect.pov", names(post_means))]
+ave.effect.pov.ci<-ci[grep("ave.effect.pov", dimnames(ci)[[1]]), ]
+ave.effect.pov.ci <-
+  cbind.data.frame(ave.effect.pov,ave.effect.pov.ci)
+
+#RR at last time point
+log.rr.vax<-post_means[grep(paste0("^log.rr.vax.*,", ncol(j12.c),"]"), names(post_means)) ]
+log.rr.vax.ci<-ci[grep(paste0("^log.rr.vax.*,", ncol(j12.c),"]"), dimnames(ci)[[1]]), ]
+log.rr.vax.ci <- cbind.data.frame(log.rr.vax,log.rr.vax.ci)
+
+
+log.rr.vax.all<-post_means[grep(paste0("log.rr.vax"), names(post_means)) ]
+log.rr.vax.all <- 
+  t(matrix(log.rr.vax.all, ncol=ncol(j12.c)))
+
+gdp.grp<-rep(1, times=length(gdp.med))
+gdp.grp[gdp.med==1]<-2
+gdp.grp[gdp.hi==1]<-3
+
+out.list<-list('log.rr.vax'=log.rr.vax,'log.rr.vax.ci'=log.rr.vax.ci,
+               'log.rr.vax.all'=log.rr.vax.all,
+           'theta1'=theta1,'beta2'=beta2,'beta2.ci'=beta2.ci,'theta1.ci'=theta1.ci,
+            'beta1'=beta1,'beta1.ci'=beta1.ci,'ave.effect.pov.ci'=ave.effect.pov.ci,'posteriors'=posterior_samples.all[seq(from=1,to=sampleN, by=10),],'gdp.grp'=gdp.grp)
+saveRDS(out.list, 'gdp.output.BR.V1.rds')
+
+#v1; AR1
+```
+
+
+```{r}
+res1 <- readRDS( 'gdp.output.BR.V1.rds')
+theta1 <- res1$theta1
+theta1.ci <- res1$theta1.ci
+ave.effect.pov.ci <- res1$ave.effect.pov.ci
+log.rr.vax <- res1$log.rr.vax
+
+posteriors <- res1$posteriors
+ave.effect.pov.mc<-
+  posteriors[,grep("ave.effect.pov", dimnames(posteriors)[[2]] )]
+ave.effect.pov.mc.90 <- ave.effect.pov.mc  * 0.9/sd.vax.c
+ave.effect.pov.mc.90.hdi <- t(apply(ave.effect.pov.mc.90,2, hdi, credMass = 0.95))
+ave.effect.pov.mc.90.med <- apply(ave.effect.pov.mc.90,2, median)
+ave.effect.pov.mc.90.hdi <- cbind.data.frame(ave.effect.pov.mc.90.med,ave.effect.pov.mc.90.hdi)
+rr_pov_hdi <- exp(ave.effect.pov.mc.90.hdi)
+
+```
+
+
+### Estimate RR for 90% coverage by mesoregion, separated by GDP
+```{r, fig.width=5, fig.height=5}
+theta1.rescale <- theta1*(0.9)/sd.vax.c
+theta1.ci.rescale <- theta1.ci*(0.9)/sd.vax.c 
+exp.ave.ci <- rr_pov_hdi
+
+gdp.grp<-rep(1, times=length(gdp.med))
+gdp.grp[gdp.med==1]<-2
+gdp.grp[gdp.hi==1]<-3
+set.seed(123)
+xjit <- rnorm(n=length(gdp.grp),0,0.1)
+plot.cols<-c('#e41a1c80','#377eb880','#4daf4a80') #red, blue green
+trans.black <- rgb(0,0,0,alpha=0.1)
+
+# plot((gdp.grp+xjit),exp(theta1.rescale),  bty='l', pch=16, ylim=c(0.4,max(exp(theta1.ci.rescale), na.rm=T)),cex=0.75, col=plot.cols[gdp.grp], xlim=c(0.75,3.4), xaxt='n', main='Estimated decline for 90% coverage', xlab='', ylab='Coefficient')
+
+symbols((gdp.grp+xjit),exp(theta1.rescale)  , circles=sqrt(j12.c$`2010` /pi) , bg=plot.cols[gdp.grp],fg='white', inches=0.3,bty='l',ylim=c(0.4,max(exp(theta1.ci.rescale), na.rm=T)),main='Vaccine effect', xlab='',xaxt='n',  col=plot.cols[gdp.grp], xaxt='n', ylab='Rate ratio for 90% uptake')
+
+arrows(x0=(gdp.grp+xjit) , y0=exp(theta1.ci.rescale[,1]) , y1=exp(theta1.ci.rescale[,2]), length=0, col=trans.black)
+
+abline(h=1, col='black', lty=2)
+
+axis(side=1, at=c(1,2,3), labels = c('Low GDP', 'Med GDP', 'High GDP'))
+for(i in 1:3){
+  x1 <- i + c(0.35,0.4,0.45,0.4,0.35)
+  y1 <- c(exp.ave.ci[i,1],exp.ave.ci[i,3],exp.ave.ci[i,1],exp.ave.ci[i,2],exp.ave.ci[i,1])
+  polygon(x1,y1,col=plot.cols[i],border=0)
+}
+```
+
+##Average decline by GDP group
+```{r}
+round(100*(1-rr_pov_hdi),1)
+round(rr_pov_hdi,2)
+
+```
+
+
+### Estimate decline by mesoregion, separated by GDP
+slope*uptake in final year
+```{r, fig.width=5, fig.height=5}
+log.rr.vax.ci <- res1$log.rr.vax.ci
+log.rr.vax <- res1$log.rr.vax
+
+gdp.grp<-rep(1, times=length(gdp.med))
+gdp.grp[gdp.med==1]<-2
+gdp.grp[gdp.hi==1]<-3
+set.seed(123)
+xjit <- rnorm(n=length(gdp.grp),0,0.1)
+plot.cols<-c('#e41a1c80','#377eb880','#4daf4a80') #red, blue green
+
+trans.black <- rgb(0,0,0,alpha=0.1)
+# plot((gdp.grp+xjit),exp(log.rr.vax),  bty='l', pch=16, ylim=range(exp(log.rr.vax.ci), na.rm=T), cex=0.75,main='Vaccine effect', xlab='', ylab='Vaccine effect 2015', col=plot.cols[gdp.grp], xaxt='n')
+
+symbols((gdp.grp+xjit),exp(log.rr.vax)  , circles=sqrt(j12.c$`2010` /pi) , bg=plot.cols[gdp.grp],fg='white', inches=0.3,bty='l',ylim=range(exp(log.rr.vax.ci), na.rm=T),main='Vaccine effect', xlab='', ylab='Vaccine effect 2015', col=plot.cols[gdp.grp], xaxt='n')
+
+arrows(x0=(gdp.grp+xjit) , y0=exp(log.rr.vax.ci[,2]) , y1=exp(log.rr.vax.ci[,3]), length=0, col=trans.black)
+abline(h=1, col='black', lty=2)
+
+axis(side=1, at=c(1,2,3), labels = c('Low GDP', 'Med GDP', 'High GDP'))
+
+```
+Uptake vs RR.
+```{r, fig.width=8, fig.height=3}
+gdp.grp<-rep(1, times=length(gdp.med))
+gdp.grp[gdp.med==1]<-2
+gdp.grp[gdp.hi==1]<-3
+plot.cols<-c('#e41a1c','#377eb8','#4daf4a') #red, blue green
+
+par(mfrow=c(1,3))
+plot( vax.c[,'2011']*100,exp(log.rr.vax.all[7,]), col=plot.cols[gdp.grp], pch=16, bty='l', ylab="Rate Ratio", xlab='3 dose uptake (%)', xlim=c(0,140))
+abline(h=1, lty=2)
+
+plot( vax.c[,'2013']*100,exp(log.rr.vax.all[9,]), col=plot.cols[gdp.grp], pch=16, bty='l', ylab="Rate Ratio", xlab='3 dose uptake (%)', xlim=c(0,140))
+abline(h=1, lty=2)
+
+ plot( vax.c[,'2015']*100,exp(log.rr.vax.all[11,]), col=plot.cols[gdp.grp], pch=16, bty='l', ylab="Rate Ratio", xlab='3 dose uptake (%)', xlim=c(0,140))
+ abline(h=1, lty=2)
+
+```
+
+```{r, fig.width=3, fig.height=3}
+ plot( vax.c[,'2015']*100,exp(log.rr.vax), col=plot.cols[gdp.grp], pch=16, bty='l', ylab="Rate Ratio", xlab='3 dose uptake (%)', xlim=c(0,140), ylim=c(0.6, 1.1))
+ abline(h=1, lty=2)
+```
+
+```{r}
+# Time series for 3rd dose coverage by dept.inc
+par(mfrow=c(1,1))
+matplot(t(vax.c)*100, type="l", bty="l", 
+        main="Brazil", axes=F,
+        ylab="Coverage (%)", xlab="Year", col=gdp.cat)
+axis(2)
+axis(side=1,at=1:11,labels=c(2005:2015))
+```
+
+
+## Boxplot for coverage by income level
+```{r, fig.width=4, fig.height=5}
+par(mfrow=c(1,1))
+gdp.grp<-rep(1, times=length(gdp.med))
+gdp.grp[gdp.med==1]<-2
+gdp.grp[gdp.hi==1]<-3
+par(bty='n')
+boxplot(vax.c[,'2015']*100  ~ gdp.grp,  ylim=c(0,120), col="grey",
+        main="Brazil in 2015",
+        names=c("Low","Medium","High"), xlab="Income level", ylab="Coverage (%)")
+```
+ 
+ 
